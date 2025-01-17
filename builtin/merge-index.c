@@ -1,7 +1,9 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
 #include "hex.h"
 #include "read-cache-ll.h"
-#include "repository.h"
 #include "run-command.h"
 #include "sparse-index.h"
 
@@ -73,7 +75,10 @@ static void merge_all(void)
 	}
 }
 
-int cmd_merge_index(int argc, const char **argv, const char *prefix UNUSED)
+int cmd_merge_index(int argc,
+		    const char **argv,
+		    const char *prefix UNUSED,
+		    struct repository *repo UNUSED)
 {
 	int i, force_file = 0;
 

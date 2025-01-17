@@ -2,6 +2,9 @@
  * The backend-independent part of the reference module.
  */
 
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "git-compat-util.h"
 #include "advice.h"
 #include "config.h"
@@ -22,12 +25,13 @@
 #include "submodule.h"
 #include "worktree.h"
 #include "strvec.h"
-#include "repository.h"
+#include "repo-settings.h"
 #include "setup.h"
 #include "sigchain.h"
 #include "date.h"
 #include "commit.h"
 #include "wildmatch.h"
+#include "ident.h"
 
 /*
  * List of all available backends
@@ -37,14 +41,15 @@ static const struct ref_storage_be *refs_backends[] = {
 	[REF_STORAGE_FORMAT_REFTABLE] = &refs_be_reftable,
 };
 
-static const struct ref_storage_be *find_ref_storage_backend(unsigned int ref_storage_format)
+static const struct ref_storage_be *find_ref_storage_backend(
+	enum ref_storage_format ref_storage_format)
 {
 	if (ref_storage_format < ARRAY_SIZE(refs_backends))
 		return refs_backends[ref_storage_format];
 	return NULL;
 }
 
-unsigned int ref_storage_format_by_name(const char *name)
+enum ref_storage_format ref_storage_format_by_name(const char *name)
 {
 	for (unsigned int i = 0; i < ARRAY_SIZE(refs_backends); i++)
 		if (refs_backends[i] && !strcmp(refs_backends[i]->name, name))
@@ -52,7 +57,7 @@ unsigned int ref_storage_format_by_name(const char *name)
 	return REF_STORAGE_FORMAT_UNKNOWN;
 }
 
-const char *ref_storage_format_to_name(unsigned int ref_storage_format)
+const char *ref_storage_format_to_name(enum ref_storage_format ref_storage_format)
 {
 	const struct ref_storage_be *be = find_ref_storage_backend(ref_storage_format);
 	if (!be)
@@ -158,7 +163,7 @@ void update_ref_namespace(enum ref_namespace namespace, char *ref)
 {
 	struct ref_namespace_info *info = &ref_namespace[namespace];
 	if (info->ref_updated)
-		free(info->ref);
+		free((char *)info->ref);
 	info->ref = ref;
 	info->ref_updated = 1;
 }
@@ -315,6 +320,12 @@ int check_refname_format(const char *refname, int flags)
 	return check_or_sanitize_refname(refname, flags, NULL);
 }
 
+int refs_fsck(struct ref_store *refs, struct fsck_options *o,
+	      struct worktree *wt)
+{
+	return refs->be->fsck(refs, o, wt);
+}
+
 void sanitize_refname_component(const char *refname, struct strbuf *out)
 {
 	if (check_or_sanitize_refname(refname, REFNAME_ALLOW_ONELEVEL, out))
@@ -411,7 +422,7 @@ int refs_ref_exists(struct ref_store *refs, const char *refname)
 					 NULL, NULL);
 }
 
-static int for_each_filter_refs(const char *refname,
+static int for_each_filter_refs(const char *refname, const char *referent,
 				const struct object_id *oid,
 				int flags, void *data)
 {
@@ -421,7 +432,7 @@ static int for_each_filter_refs(const char *refname,
 		return 0;
 	if (filter->prefix)
 		skip_prefix(refname, filter->prefix, &refname);
-	return filter->fn(refname, oid, flags, filter->cb_data);
+	return filter->fn(refname, referent, oid, flags, filter->cb_data);
 }
 
 struct warn_if_dangling_data {
@@ -432,7 +443,7 @@ struct warn_if_dangling_data {
 	const char *msg_fmt;
 };
 
-static int warn_if_dangling_symref(const char *refname,
+static int warn_if_dangling_symref(const char *refname, const char *referent UNUSED,
 				   const struct object_id *oid UNUSED,
 				   int flags, void *cb_data)
 {
@@ -503,7 +514,7 @@ int refs_head_ref_namespaced(struct ref_store *refs, each_ref_fn fn, void *cb_da
 
 	strbuf_addf(&buf, "%sHEAD", get_git_namespace());
 	if (!refs_read_ref_full(refs, buf.buf, RESOLVE_REF_READING, &oid, &flag))
-		ret = fn(buf.buf, &oid, flag, cb_data);
+		ret = fn(buf.buf, NULL, &oid, flag, cb_data);
 	strbuf_release(&buf);
 
 	return ret;
@@ -689,6 +700,53 @@ static char *substitute_branch_name(struct repository *r,
 	return NULL;
 }
 
+void copy_branchname(struct strbuf *sb, const char *name, unsigned allowed)
+{
+	int len = strlen(name);
+	struct interpret_branch_name_options options = {
+		.allowed = allowed
+	};
+	int used = repo_interpret_branch_name(the_repository, name, len, sb,
+					      &options);
+
+	if (used < 0)
+		used = 0;
+	strbuf_add(sb, name + used, len - used);
+}
+
+int check_branch_ref(struct strbuf *sb, const char *name)
+{
+	if (startup_info->have_repository)
+		copy_branchname(sb, name, INTERPRET_BRANCH_LOCAL);
+	else
+		strbuf_addstr(sb, name);
+
+	/*
+	 * This splice must be done even if we end up rejecting the
+	 * name; builtin/branch.c::copy_or_rename_branch() still wants
+	 * to see what the name expanded to so that "branch -m" can be
+	 * used as a tool to correct earlier mistakes.
+	 */
+	strbuf_splice(sb, 0, 0, "refs/heads/", 11);
+
+	if (*name == '-' ||
+	    !strcmp(sb->buf, "refs/heads/HEAD"))
+		return -1;
+
+	return check_refname_format(sb->buf, 0);
+}
+
+int check_tag_ref(struct strbuf *sb, const char *name)
+{
+	if (name[0] == '-' || !strcmp(name, "HEAD"))
+		return -1;
+
+	strbuf_reset(sb);
+	strbuf_addf(sb, "refs/tags/%s", name);
+
+	return check_refname_format(sb->buf, 0);
+}
+
 int repo_dwim_ref(struct repository *r, const char *str, int len,
 		  struct object_id *oid, char **ref, int nonfatal_dangling_mark)
 {
@@ -722,7 +780,7 @@ int expand_ref(struct repository *repo, const char *str, int len,
 		if (r) {
 			if (!refs_found++)
 				*ref = xstrdup(r);
-			if (!warn_ambiguous_refs)
+			if (!repo_settings_get_warn_ambiguous_refs(repo))
 				break;
 		} else if ((flag & REF_ISSYMREF) && strcmp(fullref.buf, "HEAD")) {
 			warning(_("ignoring dangling symref %s"), fullref.buf);
@@ -767,7 +825,7 @@ int repo_dwim_log(struct repository *r, const char *str, int len,
 			if (oid)
 				oidcpy(oid, &hash);
 		}
-		if (!warn_ambiguous_refs)
+		if (!repo_settings_get_warn_ambiguous_refs(r))
 			break;
 	}
 	strbuf_release(&path);
@@ -910,10 +968,10 @@ int refs_delete_ref(struct ref_store *refs, const char *msg,
 	struct ref_transaction *transaction;
 	struct strbuf err = STRBUF_INIT;
 
-	transaction = ref_store_transaction_begin(refs, &err);
+	transaction = ref_store_transaction_begin(refs, 0, &err);
 	if (!transaction ||
 	    ref_transaction_delete(transaction, refname, old_oid,
-				   flags, msg, &err) ||
+				   NULL, flags, msg, &err) ||
 	    ref_transaction_commit(transaction, &err)) {
 		error("%s", err.buf);
 		ref_transaction_free(transaction);
@@ -950,7 +1008,8 @@ static char *normalize_reflog_message(const char *msg)
 	return strbuf_detach(&sb, NULL);
 }
 
-int should_autocreate_reflog(const char *refname)
+int should_autocreate_reflog(enum log_refs_config log_all_ref_updates,
+			     const char *refname)
 {
 	switch (log_all_ref_updates) {
 	case LOG_REFS_ALWAYS:
@@ -1107,6 +1166,7 @@ int read_ref_at(struct ref_store *refs, const char *refname,
 }
 
 struct ref_transaction *ref_store_transaction_begin(struct ref_store *refs,
+						    unsigned int flags,
 						    struct strbuf *err)
 {
 	struct ref_transaction *tr;
@@ -1114,6 +1174,7 @@ struct ref_transaction *ref_store_transaction_begin(struct ref_store *refs,
 
 	CALLOC_ARRAY(tr, 1);
 	tr->ref_store = refs;
+	tr->flags = flags;
 	return tr;
 }
 
@@ -1139,6 +1200,7 @@ void ref_transaction_free(struct ref_transaction *transaction)
 
 	for (i = 0; i < transaction->nr; i++) {
 		free(transaction->updates[i]->msg);
+		free(transaction->updates[i]->committer_info);
 		free((char *)transaction->updates[i]->new_target);
 		free((char *)transaction->updates[i]->old_target);
 		free(transaction->updates[i]);
@@ -1153,6 +1215,7 @@ struct ref_update *ref_transaction_add_update(
 		const struct object_id *new_oid,
 		const struct object_id *old_oid,
 		const char *new_target, const char *old_target,
+		const char *committer_info,
 		const char *msg)
 {
 	struct ref_update *update;
@@ -1177,9 +1240,42 @@ struct ref_update *ref_transaction_add_update(
 		oidcpy(&update->new_oid, new_oid);
 	if ((flags & REF_HAVE_OLD) && old_oid)
 		oidcpy(&update->old_oid, old_oid);
+	if (!(flags & REF_SKIP_CREATE_REFLOG)) {
+		update->committer_info = xstrdup_or_null(committer_info);
+		update->msg = normalize_reflog_message(msg);
+	}
 
-	update->msg = normalize_reflog_message(msg);
 	return update;
+}
+
+static int transaction_refname_valid(const char *refname,
+				     const struct object_id *new_oid,
+				     unsigned int flags, struct strbuf *err)
+{
+	if (flags & REF_SKIP_REFNAME_VERIFICATION)
+		return 1;
+
+	if (is_pseudo_ref(refname)) {
+		const char *refusal_msg;
+		if (flags & REF_LOG_ONLY)
+			refusal_msg = _("refusing to update reflog for pseudoref '%s'");
+		else
+			refusal_msg = _("refusing to update pseudoref '%s'");
+		strbuf_addf(err, refusal_msg, refname);
+		return 0;
+	} else if ((new_oid && !is_null_oid(new_oid)) ?
+		 check_refname_format(refname, REFNAME_ALLOW_ONELEVEL) :
+		 !refname_is_safe(refname)) {
+		const char *refusal_msg;
+		if (flags & REF_LOG_ONLY)
+			refusal_msg = _("refusing to update reflog with bad name '%s'");
+		else
+			refusal_msg = _("refusing to update ref with bad name '%s'");
+		strbuf_addf(err, refusal_msg, refname);
+		return 0;
+	}
+
+	return 1;
 }
 
 int ref_transaction_update(struct ref_transaction *transaction,
@@ -1193,21 +1289,14 @@ int ref_transaction_update(struct ref_transaction *transaction,
 {
 	assert(err);
 
-	if (!(flags & REF_SKIP_REFNAME_VERIFICATION) &&
-	    ((new_oid && !is_null_oid(new_oid)) ?
-		     check_refname_format(refname, REFNAME_ALLOW_ONELEVEL) :
-			   !refname_is_safe(refname))) {
-		strbuf_addf(err, _("refusing to update ref with bad name '%s'"),
-			    refname);
+	if ((flags & REF_FORCE_CREATE_REFLOG) &&
+	    (flags & REF_SKIP_CREATE_REFLOG)) {
+		strbuf_addstr(err, _("refusing to force and skip creation of reflog"));
 		return -1;
 	}
 
-	if (!(flags & REF_SKIP_REFNAME_VERIFICATION) &&
-	    is_pseudo_ref(refname)) {
-		strbuf_addf(err, _("refusing to update pseudoref '%s'"),
-			    refname);
+	if (!transaction_refname_valid(refname, new_oid, flags, err))
 		return -1;
-	}
 
 	if (flags & ~REF_TRANSACTION_UPDATE_ALLOWED_FLAGS)
 		BUG("illegal flags 0x%x passed to ref_transaction_update()", flags);
@@ -1224,50 +1313,95 @@ int ref_transaction_update(struct ref_transaction *transaction,
 
 	ref_transaction_add_update(transaction, refname, flags,
 				   new_oid, old_oid, new_target,
-				   old_target, msg);
+				   old_target, NULL, msg);
+
+	return 0;
+}
+
+int ref_transaction_update_reflog(struct ref_transaction *transaction,
+				  const char *refname,
+				  const struct object_id *new_oid,
+				  const struct object_id *old_oid,
+				  const char *committer_info, unsigned int flags,
+				  const char *msg, unsigned int index,
+				  struct strbuf *err)
+{
+	struct ref_update *update;
+
+	assert(err);
+
+	flags |= REF_LOG_ONLY | REF_NO_DEREF;
+
+	if (!transaction_refname_valid(refname, new_oid, flags, err))
+		return -1;
+
+	update = ref_transaction_add_update(transaction, refname, flags,
+					    new_oid, old_oid, NULL, NULL,
+					    committer_info, msg);
+	/*
+	 * While we do set the old_oid value, we unset the flag to skip
+	 * old_oid verification which only makes sense for refs.
+	 */
+	update->flags &= ~REF_HAVE_OLD;
+	update->index = index;
+
 	return 0;
 }
 
 int ref_transaction_create(struct ref_transaction *transaction,
 			   const char *refname,
 			   const struct object_id *new_oid,
+			   const char *new_target,
 			   unsigned int flags, const char *msg,
 			   struct strbuf *err)
 {
-	if (!new_oid || is_null_oid(new_oid)) {
-		strbuf_addf(err, "'%s' has a null OID", refname);
+	if (new_oid && new_target)
+		BUG("create called with both new_oid and new_target set");
+	if ((!new_oid || is_null_oid(new_oid)) && !new_target) {
+		strbuf_addf(err, "'%s' has neither a valid OID nor a target", refname);
 		return 1;
 	}
 	return ref_transaction_update(transaction, refname, new_oid,
-				      null_oid(), NULL, NULL, flags,
+				      null_oid(), new_target, NULL, flags,
 				      msg, err);
 }
 
 int ref_transaction_delete(struct ref_transaction *transaction,
 			   const char *refname,
 			   const struct object_id *old_oid,
-			   unsigned int flags, const char *msg,
+			   const char *old_target,
+			   unsigned int flags,
+			   const char *msg,
 			   struct strbuf *err)
 {
 	if (old_oid && is_null_oid(old_oid))
 		BUG("delete called with old_oid set to zeros");
+	if (old_oid && old_target)
+		BUG("delete called with both old_oid and old_target set");
+	if (old_target && !(flags & REF_NO_DEREF))
+		BUG("delete cannot operate on symrefs with deref mode");
 	return ref_transaction_update(transaction, refname,
 				      null_oid(), old_oid,
-				      NULL, NULL, flags,
+				      NULL, old_target, flags,
 				      msg, err);
 }
 
 int ref_transaction_verify(struct ref_transaction *transaction,
 			   const char *refname,
 			   const struct object_id *old_oid,
+			   const char *old_target,
 			   unsigned int flags,
 			   struct strbuf *err)
 {
-	if (!old_oid)
-		BUG("verify called with old_oid set to NULL");
+	if (!old_target && !old_oid)
+		BUG("verify called with old_oid and old_target set to NULL");
+	if (old_oid && old_target)
+		BUG("verify called with both old_oid and old_target set");
+	if (old_target && !(flags & REF_NO_DEREF))
+		BUG("verify cannot operate on symrefs with deref mode");
 	return ref_transaction_update(transaction, refname,
 				      NULL, old_oid,
-				      NULL, NULL,
+				      NULL, old_target,
 				      flags, NULL, err);
 }
 
@@ -1280,7 +1414,7 @@ int refs_update_ref(struct ref_store *refs, const char *msg,
 	struct strbuf err = STRBUF_INIT;
 	int ret = 0;
 
-	t = ref_store_transaction_begin(refs, &err);
+	t = ref_store_transaction_begin(refs, 0, &err);
 	if (!t ||
 	    ref_transaction_update(t, refname, new_oid, old_oid, NULL, NULL,
 				   flags, msg, &err) ||
@@ -1489,6 +1623,19 @@ const char **hidden_refs_to_excludes(const struct strvec *hide_refs)
 	return hide_refs->v;
 }
 
+const char **get_namespaced_exclude_patterns(const char **exclude_patterns,
+					     const char *namespace,
+					     struct strvec *out)
+{
+	if (!namespace || !*namespace || !exclude_patterns || !*exclude_patterns)
+		return exclude_patterns;
+
+	for (size_t i = 0; exclude_patterns[i]; i++)
+		strvec_pushf(out, "%s%s", namespace, exclude_patterns[i]);
+
+	return out->v;
+}
+
 const char *find_descendant_ref(const char *dirname,
 				const struct string_list *extras,
 				const struct string_list *skip)
@@ -1524,7 +1671,7 @@ int refs_head_ref(struct ref_store *refs, each_ref_fn fn, void *cb_data)
 
 	if (refs_resolve_ref_unsafe(refs, "HEAD", RESOLVE_REF_READING,
 				    &oid, &flag))
-		return fn("HEAD", &oid, flag, cb_data);
+		return fn("HEAD", NULL, &oid, flag, cb_data);
 
 	return 0;
 }
@@ -1606,11 +1753,19 @@ int refs_for_each_namespaced_ref(struct ref_store *refs,
 				 const char **exclude_patterns,
 				 each_ref_fn fn, void *cb_data)
 {
-	struct strbuf buf = STRBUF_INIT;
+	struct strvec namespaced_exclude_patterns = STRVEC_INIT;
+	struct strbuf prefix = STRBUF_INIT;
 	int ret;
-	strbuf_addf(&buf, "%srefs/", get_git_namespace());
-	ret = do_for_each_ref(refs, buf.buf, exclude_patterns, fn, 0, 0, cb_data);
-	strbuf_release(&buf);
+
+	exclude_patterns = get_namespaced_exclude_patterns(exclude_patterns,
+							   get_git_namespace(),
+							   &namespaced_exclude_patterns);
+
+	strbuf_addf(&prefix, "%srefs/", get_git_namespace());
+	ret = do_for_each_ref(refs, prefix.buf, exclude_patterns, fn, 0, 0, cb_data);
+
+	strvec_clear(&namespaced_exclude_patterns);
+	strbuf_release(&prefix);
 	return ret;
 }
 
@@ -1691,6 +1846,7 @@ int refs_for_each_fullref_in_prefixes(struct ref_store *ref_store,
 				      const char **exclude_patterns,
 				      each_ref_fn fn, void *cb_data)
 {
+	struct strvec namespaced_exclude_patterns = STRVEC_INIT;
 	struct string_list prefixes = STRING_LIST_INIT_DUP;
 	struct string_list_item *prefix;
 	struct strbuf buf = STRBUF_INIT;
@@ -1702,6 +1858,10 @@ int refs_for_each_fullref_in_prefixes(struct ref_store *ref_store,
 		strbuf_addstr(&buf, namespace);
 	namespace_len = buf.len;
 
+	exclude_patterns = get_namespaced_exclude_patterns(exclude_patterns,
+							   namespace,
+							   &namespaced_exclude_patterns);
+
 	for_each_string_list_item(prefix, &prefixes) {
 		strbuf_addstr(&buf, prefix->string);
 		ret = refs_for_each_fullref_in(ref_store, buf.buf,
@@ -1711,6 +1871,7 @@ int refs_for_each_fullref_in_prefixes(struct ref_store *ref_store,
 		strbuf_setlen(&buf, namespace_len);
 	}
 
+	strvec_clear(&namespaced_exclude_patterns);
 	string_list_clear(&prefixes, 0);
 	strbuf_release(&buf);
 	return ret;
@@ -1731,8 +1892,8 @@ static int refs_read_special_head(struct ref_store *ref_store,
 		goto done;
 	}
 
-	result = parse_loose_ref_contents(content.buf, oid, referent, type,
-					  failure_errno);
+	result = parse_loose_ref_contents(ref_store->repo->hash_algo, content.buf,
+					  oid, referent, type, NULL, failure_errno);
 
 done:
 	strbuf_release(&full_path);
@@ -1815,7 +1976,7 @@ const char *refs_resolve_ref_unsafe(struct ref_store *refs,
 			    failure_errno != ENOTDIR)
 				return NULL;
 
-			oidclr(oid);
+			oidclr(oid, refs->repo->hash_algo);
 			if (*flags & REF_BAD_NAME)
 				*flags |= REF_ISBROKEN;
 			return refname;
@@ -1825,7 +1986,7 @@ const char *refs_resolve_ref_unsafe(struct ref_store *refs,
 
 		if (!(read_flags & REF_ISSYMREF)) {
 			if (*flags & REF_BAD_NAME) {
-				oidclr(oid);
+				oidclr(oid, refs->repo->hash_algo);
 				*flags |= REF_ISBROKEN;
 			}
 			return refname;
@@ -1833,7 +1994,7 @@ const char *refs_resolve_ref_unsafe(struct ref_store *refs,
 
 		refname = sb_refname.buf;
 		if (resolve_flags & RESOLVE_REF_NO_RECURSE) {
-			oidclr(oid);
+			oidclr(oid, refs->repo->hash_algo);
 			return refname;
 		}
 		if (check_refname_format(refname, REFNAME_ALLOW_ONELEVEL)) {
@@ -1852,6 +2013,11 @@ const char *refs_resolve_ref_unsafe(struct ref_store *refs,
 int ref_store_create_on_disk(struct ref_store *refs, int flags, struct strbuf *err)
 {
 	return refs->be->create_on_disk(refs, flags, err);
+}
+
+int ref_store_remove_on_disk(struct ref_store *refs, struct strbuf *err)
+{
+	return refs->be->remove_on_disk(refs, err);
 }
 
 int repo_resolve_gitlink_ref(struct repository *r,
@@ -1890,16 +2056,17 @@ static struct ref_store *lookup_ref_store_map(struct strmap *map,
 
 /*
  * Create, record, and return a ref_store instance for the specified
- * gitdir.
+ * gitdir using the given ref storage format.
  */
 static struct ref_store *ref_store_init(struct repository *repo,
+					enum ref_storage_format format,
 					const char *gitdir,
 					unsigned int flags)
 {
 	const struct ref_storage_be *be;
 	struct ref_store *refs;
 
-	be = find_ref_storage_backend(repo->ref_storage_format);
+	be = find_ref_storage_backend(format);
 	if (!be)
 		BUG("reference backend is unknown");
 
@@ -1921,7 +2088,8 @@ struct ref_store *get_main_ref_store(struct repository *r)
 	if (!r->gitdir)
 		BUG("attempting to get main_ref_store outside of repository");
 
-	r->refs_private = ref_store_init(r, r->gitdir, REF_STORE_ALL_CAPS);
+	r->refs_private = ref_store_init(r, r->ref_storage_format,
+					 r->gitdir, REF_STORE_ALL_CAPS);
 	r->refs_private = maybe_debug_wrap_ref_store(r->gitdir, r->refs_private);
 	return r->refs_private;
 }
@@ -1981,7 +2149,8 @@ struct ref_store *repo_get_submodule_ref_store(struct repository *repo,
 		free(subrepo);
 		goto done;
 	}
-	refs = ref_store_init(subrepo, submodule_sb.buf,
+	refs = ref_store_init(subrepo, subrepo->ref_storage_format,
+			      submodule_sb.buf,
 			      REF_STORE_READ | REF_STORE_ODB);
 	register_ref_store_map(&repo->submodule_ref_stores, "submodule",
 			       refs, submodule);
@@ -2010,12 +2179,12 @@ struct ref_store *get_worktree_ref_store(const struct worktree *wt)
 		struct strbuf common_path = STRBUF_INIT;
 		strbuf_git_common_path(&common_path, wt->repo,
 				      "worktrees/%s", wt->id);
-		refs = ref_store_init(wt->repo, common_path.buf,
-				      REF_STORE_ALL_CAPS);
+		refs = ref_store_init(wt->repo, wt->repo->ref_storage_format,
+				      common_path.buf, REF_STORE_ALL_CAPS);
 		strbuf_release(&common_path);
 	} else {
-		refs = ref_store_init(wt->repo, wt->repo->commondir,
-				      REF_STORE_ALL_CAPS);
+		refs = ref_store_init(wt->repo, wt->repo->ref_storage_format,
+				      wt->repo->commondir, REF_STORE_ALL_CAPS);
 	}
 
 	if (refs)
@@ -2052,19 +2221,53 @@ int peel_iterated_oid(struct repository *r, const struct object_id *base, struct
 int refs_update_symref(struct ref_store *refs, const char *ref,
 		       const char *target, const char *logmsg)
 {
+	return refs_update_symref_extended(refs, ref, target, logmsg, NULL, 0);
+}
+
+int refs_update_symref_extended(struct ref_store *refs, const char *ref,
+		       const char *target, const char *logmsg,
+		       struct strbuf *referent, int create_only)
+{
 	struct ref_transaction *transaction;
 	struct strbuf err = STRBUF_INIT;
-	int ret = 0;
+	int ret = 0, prepret = 0;
 
-	transaction = ref_store_transaction_begin(refs, &err);
-	if (!transaction ||
-	    ref_transaction_update(transaction, ref, NULL, NULL,
-				   target, NULL, REF_NO_DEREF,
-				   logmsg, &err) ||
-	    ref_transaction_commit(transaction, &err)) {
+	transaction = ref_store_transaction_begin(refs, 0, &err);
+	if (!transaction) {
+	error_return:
 		ret = error("%s", err.buf);
+		goto cleanup;
+	}
+	if (create_only) {
+		if (ref_transaction_create(transaction, ref, NULL, target,
+					   REF_NO_DEREF, logmsg, &err))
+			goto error_return;
+		prepret = ref_transaction_prepare(transaction, &err);
+		if (prepret && prepret != TRANSACTION_CREATE_EXISTS)
+			goto error_return;
+	} else {
+		if (ref_transaction_update(transaction, ref, NULL, NULL,
+					   target, NULL, REF_NO_DEREF,
+					   logmsg, &err) ||
+			ref_transaction_prepare(transaction, &err))
+			goto error_return;
 	}
 
+	if (referent && refs_read_symbolic_ref(refs, ref, referent) == NOT_A_SYMREF) {
+		struct object_id oid;
+		if (!refs_read_ref(refs, ref, &oid)) {
+			strbuf_addstr(referent, oid_to_hex(&oid));
+			ret = NOT_A_SYMREF;
+		}
+	}
+
+	if (prepret == TRANSACTION_CREATE_EXISTS)
+		goto cleanup;
+
+	if (ref_transaction_commit(transaction, &err))
+		goto error_return;
+
+cleanup:
 	strbuf_release(&err);
 	if (transaction)
 		ref_transaction_free(transaction);
@@ -2103,7 +2306,7 @@ static int run_transaction_hook(struct ref_transaction *transaction,
 	const char *hook;
 	int ret = 0, i;
 
-	hook = find_hook("reference-transaction");
+	hook = find_hook(transaction->ref_store->repo, "reference-transaction");
 	if (!hook)
 		return ret;
 
@@ -2120,6 +2323,9 @@ static int run_transaction_hook(struct ref_transaction *transaction,
 
 	for (i = 0; i < transaction->nr; i++) {
 		struct ref_update *update = transaction->updates[i];
+
+		if (update->flags & REF_LOG_ONLY)
+			continue;
 
 		strbuf_reset(&buf);
 
@@ -2249,7 +2455,7 @@ int ref_transaction_commit(struct ref_transaction *transaction,
 	}
 
 	ret = refs->be->transaction_finish(refs, transaction, err);
-	if (!ret)
+	if (!ret && !(transaction->flags & REF_TRANSACTION_FLAG_INITIAL))
 		run_transaction_hook(transaction, "committed");
 	return ret;
 }
@@ -2258,6 +2464,7 @@ int refs_verify_refname_available(struct ref_store *refs,
 				  const char *refname,
 				  const struct string_list *extras,
 				  const struct string_list *skip,
+				  unsigned int initial_transaction,
 				  struct strbuf *err)
 {
 	const char *slash;
@@ -2266,8 +2473,6 @@ int refs_verify_refname_available(struct ref_store *refs,
 	struct strbuf referent = STRBUF_INIT;
 	struct object_id oid;
 	unsigned int type;
-	struct ref_iterator *iter;
-	int ok;
 	int ret = -1;
 
 	/*
@@ -2297,7 +2502,8 @@ int refs_verify_refname_available(struct ref_store *refs,
 		if (skip && string_list_has_string(skip, dirname.buf))
 			continue;
 
-		if (!refs_read_raw_ref(refs, dirname.buf, &oid, &referent,
+		if (!initial_transaction &&
+		    !refs_read_raw_ref(refs, dirname.buf, &oid, &referent,
 				       &type, &ignore_errno)) {
 			strbuf_addf(err, _("'%s' exists; cannot create '%s'"),
 				    dirname.buf, refname);
@@ -2322,21 +2528,26 @@ int refs_verify_refname_available(struct ref_store *refs,
 	strbuf_addstr(&dirname, refname + dirname.len);
 	strbuf_addch(&dirname, '/');
 
-	iter = refs_ref_iterator_begin(refs, dirname.buf, NULL, 0,
-				       DO_FOR_EACH_INCLUDE_BROKEN);
-	while ((ok = ref_iterator_advance(iter)) == ITER_OK) {
-		if (skip &&
-		    string_list_has_string(skip, iter->refname))
-			continue;
+	if (!initial_transaction) {
+		struct ref_iterator *iter;
+		int ok;
 
-		strbuf_addf(err, _("'%s' exists; cannot create '%s'"),
-			    iter->refname, refname);
-		ref_iterator_abort(iter);
-		goto cleanup;
+		iter = refs_ref_iterator_begin(refs, dirname.buf, NULL, 0,
+					       DO_FOR_EACH_INCLUDE_BROKEN);
+		while ((ok = ref_iterator_advance(iter)) == ITER_OK) {
+			if (skip &&
+			    string_list_has_string(skip, iter->refname))
+				continue;
+
+			strbuf_addf(err, _("'%s' exists; cannot create '%s'"),
+				    iter->refname, refname);
+			ref_iterator_abort(iter);
+			goto cleanup;
+		}
+
+		if (ok != ITER_DONE)
+			BUG("error while iterating over references");
 	}
-
-	if (ok != ITER_DONE)
-		BUG("error while iterating over references");
 
 	extra_refname = find_descendant_ref(dirname.buf, extras, skip);
 	if (extra_refname)
@@ -2357,8 +2568,9 @@ struct do_for_each_reflog_help {
 };
 
 static int do_for_each_reflog_helper(const char *refname,
+				     const char *referent UNUSED,
 				     const struct object_id *oid UNUSED,
-				     int flags,
+				     int flags UNUSED,
 				     void *cb_data)
 {
 	struct do_for_each_reflog_help *hp = cb_data;
@@ -2419,14 +2631,6 @@ int refs_reflog_expire(struct ref_store *refs,
 				       cleanup_fn, policy_cb_data);
 }
 
-int initial_ref_transaction_commit(struct ref_transaction *transaction,
-				   struct strbuf *err)
-{
-	struct ref_store *refs = transaction->ref_store;
-
-	return refs->be->initial_transaction_commit(refs, transaction, err);
-}
-
 void ref_transaction_for_each_queued_update(struct ref_transaction *transaction,
 					    ref_transaction_for_each_queued_update_fn cb,
 					    void *cb_data)
@@ -2462,7 +2666,7 @@ int refs_delete_refs(struct ref_store *refs, const char *logmsg,
 	 * individual updates can't fail, so we can pack all of the
 	 * updates into a single transaction.
 	 */
-	transaction = ref_store_transaction_begin(refs, &err);
+	transaction = ref_store_transaction_begin(refs, 0, &err);
 	if (!transaction) {
 		ret = error("%s", err.buf);
 		goto out;
@@ -2470,7 +2674,7 @@ int refs_delete_refs(struct ref_store *refs, const char *logmsg,
 
 	for_each_string_list_item(item, refnames) {
 		ret = ref_transaction_delete(transaction, item->string,
-					     NULL, flags, msg, &err);
+					     NULL, NULL, flags, msg, &err);
 		if (ret) {
 			warning(_("could not delete reference %s: %s"),
 				item->string, err.buf);
@@ -2554,4 +2758,361 @@ int ref_update_check_old_target(const char *referent, struct ref_update *update,
 			    ref_update_original_update_refname(update),
 			    referent, update->old_target);
 	return -1;
+}
+
+struct migration_data {
+	struct ref_store *old_refs;
+	struct ref_transaction *transaction;
+	struct strbuf *errbuf;
+	struct strbuf sb;
+};
+
+static int migrate_one_ref(const char *refname, const char *referent UNUSED, const struct object_id *oid,
+			   int flags, void *cb_data)
+{
+	struct migration_data *data = cb_data;
+	struct strbuf symref_target = STRBUF_INIT;
+	int ret;
+
+	if (flags & REF_ISSYMREF) {
+		ret = refs_read_symbolic_ref(data->old_refs, refname, &symref_target);
+		if (ret < 0)
+			goto done;
+
+		ret = ref_transaction_update(data->transaction, refname, NULL, null_oid(),
+					     symref_target.buf, NULL,
+					     REF_SKIP_CREATE_REFLOG | REF_NO_DEREF, NULL, data->errbuf);
+		if (ret < 0)
+			goto done;
+	} else {
+		ret = ref_transaction_create(data->transaction, refname, oid, NULL,
+					     REF_SKIP_CREATE_REFLOG | REF_SKIP_OID_VERIFICATION,
+					     NULL, data->errbuf);
+		if (ret < 0)
+			goto done;
+	}
+
+done:
+	strbuf_release(&symref_target);
+	return ret;
+}
+
+struct reflog_migration_data {
+	unsigned int index;
+	const char *refname;
+	struct ref_store *old_refs;
+	struct ref_transaction *transaction;
+	struct strbuf *errbuf;
+	struct strbuf *sb;
+};
+
+static int migrate_one_reflog_entry(struct object_id *old_oid,
+				    struct object_id *new_oid,
+				    const char *committer,
+				    timestamp_t timestamp, int tz,
+				    const char *msg, void *cb_data)
+{
+	struct reflog_migration_data *data = cb_data;
+	const char *date;
+	int ret;
+
+	date = show_date(timestamp, tz, DATE_MODE(NORMAL));
+	strbuf_reset(data->sb);
+	/* committer contains name and email */
+	strbuf_addstr(data->sb, fmt_ident("", committer, WANT_BLANK_IDENT, date, 0));
+
+	ret = ref_transaction_update_reflog(data->transaction, data->refname,
+					    new_oid, old_oid, data->sb->buf,
+					    REF_HAVE_NEW | REF_HAVE_OLD, msg,
+					    data->index++, data->errbuf);
+	return ret;
+}
+
+static int migrate_one_reflog(const char *refname, void *cb_data)
+{
+	struct migration_data *migration_data = cb_data;
+	struct reflog_migration_data data = {
+		.refname = refname,
+		.old_refs = migration_data->old_refs,
+		.transaction = migration_data->transaction,
+		.errbuf = migration_data->errbuf,
+		.sb = &migration_data->sb,
+	};
+
+	return refs_for_each_reflog_ent(migration_data->old_refs, refname,
+					migrate_one_reflog_entry, &data);
+}
+
+static int move_files(const char *from_path, const char *to_path, struct strbuf *errbuf)
+{
+	struct strbuf from_buf = STRBUF_INIT, to_buf = STRBUF_INIT;
+	size_t from_len, to_len;
+	DIR *from_dir;
+	int ret;
+
+	from_dir = opendir(from_path);
+	if (!from_dir) {
+		strbuf_addf(errbuf, "could not open source directory '%s': %s",
+			    from_path, strerror(errno));
+		ret = -1;
+		goto done;
+	}
+
+	strbuf_addstr(&from_buf, from_path);
+	strbuf_complete(&from_buf, '/');
+	from_len = from_buf.len;
+
+	strbuf_addstr(&to_buf, to_path);
+	strbuf_complete(&to_buf, '/');
+	to_len = to_buf.len;
+
+	while (1) {
+		struct dirent *ent;
+
+		errno = 0;
+		ent = readdir(from_dir);
+		if (!ent)
+			break;
+
+		if (!strcmp(ent->d_name, ".") ||
+		    !strcmp(ent->d_name, ".."))
+			continue;
+
+		strbuf_setlen(&from_buf, from_len);
+		strbuf_addstr(&from_buf, ent->d_name);
+
+		strbuf_setlen(&to_buf, to_len);
+		strbuf_addstr(&to_buf, ent->d_name);
+
+		ret = rename(from_buf.buf, to_buf.buf);
+		if (ret < 0) {
+			strbuf_addf(errbuf, "could not link file '%s' to '%s': %s",
+				    from_buf.buf, to_buf.buf, strerror(errno));
+			goto done;
+		}
+	}
+
+	if (errno) {
+		strbuf_addf(errbuf, "could not read entry from directory '%s': %s",
+			    from_path, strerror(errno));
+		ret = -1;
+		goto done;
+	}
+
+	ret = 0;
+
+done:
+	strbuf_release(&from_buf);
+	strbuf_release(&to_buf);
+	if (from_dir)
+		closedir(from_dir);
+	return ret;
+}
+
+static int has_worktrees(void)
+{
+	struct worktree **worktrees = get_worktrees();
+	int ret = 0;
+	size_t i;
+
+	for (i = 0; worktrees[i]; i++) {
+		if (is_main_worktree(worktrees[i]))
+			continue;
+		ret = 1;
+	}
+
+	free_worktrees(worktrees);
+	return ret;
+}
+
+int repo_migrate_ref_storage_format(struct repository *repo,
+				    enum ref_storage_format format,
+				    unsigned int flags,
+				    struct strbuf *errbuf)
+{
+	struct ref_store *old_refs = NULL, *new_refs = NULL;
+	struct ref_transaction *transaction = NULL;
+	struct strbuf new_gitdir = STRBUF_INIT;
+	struct migration_data data = {
+		.sb = STRBUF_INIT,
+	};
+	int did_migrate_refs = 0;
+	int ret;
+
+	if (repo->ref_storage_format == format) {
+		strbuf_addstr(errbuf, "current and new ref storage format are equal");
+		ret = -1;
+		goto done;
+	}
+
+	old_refs = get_main_ref_store(repo);
+
+	/*
+	 * Worktrees complicate the migration because every worktree has a
+	 * separate ref storage. While it should be feasible to implement, this
+	 * is pushed out to a future iteration.
+	 *
+	 * TODO: we should really be passing the caller-provided repository to
+	 * `has_worktrees()`, but our worktree subsystem doesn't yet support
+	 * that.
+	 */
+	if (has_worktrees()) {
+		strbuf_addstr(errbuf, "migrating repositories with worktrees is not supported yet");
+		ret = -1;
+		goto done;
+	}
+
+	/*
+	 * The overall logic looks like this:
+	 *
+	 *   1. Set up a new temporary directory and initialize it with the new
+	 *      format. This is where all refs will be migrated into.
+	 *
+	 *   2. Enumerate all refs and write them into the new ref storage.
+	 *      This operation is safe as we do not yet modify the main
+	 *      repository.
+	 *
+	 *   3. Enumerate all reflogs and write them into the new ref storage.
+	 *      This operation is safe as we do not yet modify the main
+	 *      repository.
+	 *
+	 *   4. If we're in dry-run mode then we are done and can hand over the
+	 *      directory to the caller for inspection. If not, we now start
+	 *      with the destructive part.
+	 *
+	 *   5. Delete the old ref storage from disk. As we have a copy of refs
+	 *      in the new ref storage it's okay(ish) if we now get interrupted
+	 *      as there is an equivalent copy of all refs available.
+	 *
+	 *   6. Move the new ref storage files into place.
+	 *
+	 *  7. Change the repository format to the new ref format.
+	 */
+	strbuf_addf(&new_gitdir, "%s/%s", old_refs->gitdir, "ref_migration.XXXXXX");
+	if (!mkdtemp(new_gitdir.buf)) {
+		strbuf_addf(errbuf, "cannot create migration directory: %s",
+			    strerror(errno));
+		ret = -1;
+		goto done;
+	}
+
+	new_refs = ref_store_init(repo, format, new_gitdir.buf,
+				  REF_STORE_ALL_CAPS);
+	ret = ref_store_create_on_disk(new_refs, 0, errbuf);
+	if (ret < 0)
+		goto done;
+
+	transaction = ref_store_transaction_begin(new_refs, REF_TRANSACTION_FLAG_INITIAL,
+						  errbuf);
+	if (!transaction)
+		goto done;
+
+	data.old_refs = old_refs;
+	data.transaction = transaction;
+	data.errbuf = errbuf;
+
+	/*
+	 * We need to use the internal `do_for_each_ref()` here so that we can
+	 * also include broken refs and symrefs. These would otherwise be
+	 * skipped silently.
+	 *
+	 * Ideally, we would do this call while locking the old ref storage
+	 * such that there cannot be any concurrent modifications. We do not
+	 * have the infra for that though, and the "files" backend does not
+	 * allow for a central lock due to its design. It's thus on the user to
+	 * ensure that there are no concurrent writes.
+	 */
+	ret = do_for_each_ref(old_refs, "", NULL, migrate_one_ref, 0,
+			      DO_FOR_EACH_INCLUDE_ROOT_REFS | DO_FOR_EACH_INCLUDE_BROKEN,
+			      &data);
+	if (ret < 0)
+		goto done;
+
+	ret = refs_for_each_reflog(old_refs, migrate_one_reflog, &data);
+	if (ret < 0)
+		goto done;
+
+	ret = ref_transaction_commit(transaction, errbuf);
+	if (ret < 0)
+		goto done;
+	did_migrate_refs = 1;
+
+	if (flags & REPO_MIGRATE_REF_STORAGE_FORMAT_DRYRUN) {
+		printf(_("Finished dry-run migration of refs, "
+			 "the result can be found at '%s'\n"), new_gitdir.buf);
+		ret = 0;
+		goto done;
+	}
+
+	/*
+	 * Release the new ref store such that any potentially-open files will
+	 * be closed. This is required for platforms like Cygwin, where
+	 * renaming an open file results in EPERM.
+	 */
+	ref_store_release(new_refs);
+	FREE_AND_NULL(new_refs);
+
+	/*
+	 * Until now we were in the non-destructive phase, where we only
+	 * populated the new ref store. From hereon though we are about
+	 * to get hands by deleting the old ref store and then moving
+	 * the new one into place.
+	 *
+	 * Assuming that there were no concurrent writes, the new ref
+	 * store should have all information. So if we fail from hereon
+	 * we may be in an in-between state, but it would still be able
+	 * to recover by manually moving remaining files from the
+	 * temporary migration directory into place.
+	 */
+	ret = ref_store_remove_on_disk(old_refs, errbuf);
+	if (ret < 0)
+		goto done;
+
+	ret = move_files(new_gitdir.buf, old_refs->gitdir, errbuf);
+	if (ret < 0)
+		goto done;
+
+	if (rmdir(new_gitdir.buf) < 0)
+		warning_errno(_("could not remove temporary migration directory '%s'"),
+			      new_gitdir.buf);
+
+	/*
+	 * We have migrated the repository, so we now need to adjust the
+	 * repository format so that clients will use the new ref store.
+	 * We also need to swap out the repository's main ref store.
+	 */
+	initialize_repository_version(hash_algo_by_ptr(repo->hash_algo), format, 1);
+
+	/*
+	 * Unset the old ref store and release it. `get_main_ref_store()` will
+	 * make sure to lazily re-initialize the repository's ref store with
+	 * the new format.
+	 */
+	ref_store_release(old_refs);
+	FREE_AND_NULL(old_refs);
+	repo->refs_private = NULL;
+
+	ret = 0;
+
+done:
+	if (ret && did_migrate_refs) {
+		strbuf_complete(errbuf, '\n');
+		strbuf_addf(errbuf, _("migrated refs can be found at '%s'"),
+			    new_gitdir.buf);
+	}
+
+	if (new_refs) {
+		ref_store_release(new_refs);
+		free(new_refs);
+	}
+	ref_transaction_free(transaction);
+	strbuf_release(&new_gitdir);
+	strbuf_release(&data.sb);
+	return ret;
+}
+
+int ref_update_expects_existing_old_ref(struct ref_update *update)
+{
+	return (update->flags & REF_HAVE_OLD) &&
+		(!is_null_oid(&update->old_oid) || update->old_target);
 }

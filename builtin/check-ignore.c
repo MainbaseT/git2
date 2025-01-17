@@ -1,3 +1,4 @@
+#define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
 #include "config.h"
 #include "dir.h"
@@ -5,7 +6,6 @@
 #include "quote.h"
 #include "pathspec.h"
 #include "parse-options.h"
-#include "repository.h"
 #include "submodule.h"
 #include "write-or-die.h"
 
@@ -35,8 +35,8 @@ static const struct option check_ignore_options[] = {
 
 static void output_pattern(const char *path, struct path_pattern *pattern)
 {
-	char *bang  = (pattern && pattern->flags & PATTERN_FLAG_NEGATIVE)  ? "!" : "";
-	char *slash = (pattern && pattern->flags & PATTERN_FLAG_MUSTBEDIR) ? "/" : "";
+	const char *bang  = (pattern && pattern->flags & PATTERN_FLAG_NEGATIVE)  ? "!" : "";
+	const char *slash = (pattern && pattern->flags & PATTERN_FLAG_MUSTBEDIR) ? "/" : "";
 	if (!nul_term_line) {
 		if (!verbose) {
 			write_name_quoted(path, stdout, '\n');
@@ -151,7 +151,10 @@ static int check_ignore_stdin_paths(struct dir_struct *dir, const char *prefix)
 	return num_ignored;
 }
 
-int cmd_check_ignore(int argc, const char **argv, const char *prefix)
+int cmd_check_ignore(int argc,
+		     const char **argv,
+		     const char *prefix,
+		     struct repository *repo UNUSED)
 {
 	int num_ignored;
 	struct dir_struct dir = DIR_INIT;

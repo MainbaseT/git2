@@ -17,6 +17,8 @@
    License along with the GNU C Library; if not, see
    <http://www.gnu.org/licenses/>.  */
 
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+
 #if defined __TANDEM
  /* This is currently duplicated from git-compat-utils.h */
 # ifdef NO_INTPTR_T
@@ -848,7 +850,7 @@ init_dfa (re_dfa_t *dfa, size_t pat_len)
 {
   unsigned int table_size;
 #ifndef _LIBC
-  char *codeset_name;
+  const char *codeset_name;
 #endif
 
   memset (dfa, '\0', sizeof (re_dfa_t));

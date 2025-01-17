@@ -9,7 +9,7 @@ https://developers.google.com/open-source/licenses/bsd
 #ifndef REFTABLE_RECORD_H
 #define REFTABLE_RECORD_H
 
-#include "hash-ll.h"
+#include "reftable-basics.h"
 #include <stdint.h>
 
 /*
@@ -40,10 +40,10 @@ struct reftable_ref_record {
 #define REFTABLE_NR_REF_VALUETYPES 4
 	} value_type;
 	union {
-		unsigned char val1[GIT_MAX_RAWSZ];
+		unsigned char val1[REFTABLE_HASH_SIZE_MAX];
 		struct {
-			unsigned char value[GIT_MAX_RAWSZ]; /* first hash  */
-			unsigned char target_value[GIT_MAX_RAWSZ]; /* second hash */
+			unsigned char value[REFTABLE_HASH_SIZE_MAX]; /* first hash  */
+			unsigned char target_value[REFTABLE_HASH_SIZE_MAX]; /* second hash */
 		} val2;
 		char *symref; /* referent, malloced 0-terminated string */
 	} value;
@@ -59,10 +59,6 @@ const unsigned char *reftable_ref_record_val2(const struct reftable_ref_record *
 
 /* returns whether 'ref' represents a deletion */
 int reftable_ref_record_is_deletion(const struct reftable_ref_record *ref);
-
-/* prints a reftable_ref_record onto stdout. Useful for debugging. */
-void reftable_ref_record_print(const struct reftable_ref_record *ref,
-			       uint32_t hash_id);
 
 /* frees and nulls all pointer values inside `ref`. */
 void reftable_ref_record_release(struct reftable_ref_record *ref);
@@ -89,8 +85,8 @@ struct reftable_log_record {
 
 	union {
 		struct {
-			unsigned char new_hash[GIT_MAX_RAWSZ];
-			unsigned char old_hash[GIT_MAX_RAWSZ];
+			unsigned char new_hash[REFTABLE_HASH_SIZE_MAX];
+			unsigned char old_hash[REFTABLE_HASH_SIZE_MAX];
 			char *name;
 			char *email;
 			uint64_t time;
@@ -110,9 +106,5 @@ void reftable_log_record_release(struct reftable_log_record *log);
 /* returns whether two records are equal. Useful for testing. */
 int reftable_log_record_equal(const struct reftable_log_record *a,
 			      const struct reftable_log_record *b, int hash_size);
-
-/* dumps a reftable_log_record on stdout, for debugging/testing. */
-void reftable_log_record_print(struct reftable_log_record *log,
-			       uint32_t hash_id);
 
 #endif

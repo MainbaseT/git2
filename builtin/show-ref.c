@@ -1,3 +1,4 @@
+#define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
 #include "config.h"
 #include "gettext.h"
@@ -11,8 +12,8 @@
 
 static const char * const show_ref_usage[] = {
 	N_("git show-ref [--head] [-d | --dereference]\n"
-	   "             [-s | --hash[=<n>]] [--abbrev[=<n>]] [--tags]\n"
-	   "             [--heads] [--] [<pattern>...]"),
+	   "             [-s | --hash[=<n>]] [--abbrev[=<n>]] [--branches] [--tags]\n"
+	   "             [--] [<pattern>...]"),
 	N_("git show-ref --verify [-q | --quiet] [-d | --dereference]\n"
 	   "             [-s | --hash[=<n>]] [--abbrev[=<n>]]\n"
 	   "             [--] [<ref>...]"),
@@ -63,7 +64,7 @@ struct show_ref_data {
 	int show_head;
 };
 
-static int show_ref(const char *refname, const struct object_id *oid,
+static int show_ref(const char *refname, const char *referent UNUSED, const struct object_id *oid,
 		    int flag UNUSED, void *cbdata)
 {
 	struct show_ref_data *data = cbdata;
@@ -97,6 +98,7 @@ match:
 }
 
 static int add_existing(const char *refname,
+			const char *referent UNUSED,
 			const struct object_id *oid UNUSED,
 			int flag UNUSED, void *cbdata)
 {
@@ -189,7 +191,7 @@ static int cmd_show_ref__verify(const struct show_one_options *show_one_opts,
 
 struct patterns_options {
 	int show_head;
-	int heads_only;
+	int branches_only;
 	int tags_only;
 };
 
@@ -208,8 +210,8 @@ static int cmd_show_ref__patterns(const struct patterns_options *opts,
 	if (opts->show_head)
 		refs_head_ref(get_main_ref_store(the_repository), show_ref,
 			      &show_ref_data);
-	if (opts->heads_only || opts->tags_only) {
-		if (opts->heads_only)
+	if (opts->branches_only || opts->tags_only) {
+		if (opts->branches_only)
 			refs_for_each_fullref_in(get_main_ref_store(the_repository),
 						 "refs/heads/", NULL,
 						 show_ref, &show_ref_data);
@@ -286,15 +288,20 @@ static int exclude_existing_callback(const struct option *opt, const char *arg,
 	return 0;
 }
 
-int cmd_show_ref(int argc, const char **argv, const char *prefix)
+int cmd_show_ref(int argc,
+const char **argv,
+const char *prefix,
+struct repository *repo UNUSED)
 {
 	struct exclude_existing_options exclude_existing_opts = {0};
 	struct patterns_options patterns_opts = {0};
 	struct show_one_options show_one_opts = {0};
 	int verify = 0, exists = 0;
 	const struct option show_ref_options[] = {
-		OPT_BOOL(0, "tags", &patterns_opts.tags_only, N_("only show tags (can be combined with heads)")),
-		OPT_BOOL(0, "heads", &patterns_opts.heads_only, N_("only show heads (can be combined with tags)")),
+		OPT_BOOL(0, "tags", &patterns_opts.tags_only, N_("only show tags (can be combined with --branches)")),
+		OPT_BOOL(0, "branches", &patterns_opts.branches_only, N_("only show branches (can be combined with --tags)")),
+		OPT_HIDDEN_BOOL(0, "heads", &patterns_opts.branches_only,
+				N_("deprecated synonym for --branches")),
 		OPT_BOOL(0, "exists", &exists, N_("check for reference existence without resolving")),
 		OPT_BOOL(0, "verify", &verify, N_("stricter reference checking, "
 			    "requires exact ref path")),

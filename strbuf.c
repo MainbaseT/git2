@@ -1,3 +1,5 @@
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "git-compat-util.h"
 #include "gettext.h"
 #include "hex-ll.h"
@@ -313,6 +315,15 @@ void strbuf_add(struct strbuf *sb, const void *data, size_t len)
 	strbuf_setlen(sb, sb->len + len);
 }
 
+void strbuf_addstrings(struct strbuf *sb, const char *s, size_t n)
+{
+	size_t len = strlen(s);
+
+	strbuf_grow(sb, st_mult(len, n));
+	for (size_t i = 0; i < n; i++)
+		strbuf_add(sb, s, len);
+}
+
 void strbuf_addbuf(struct strbuf *sb, const struct strbuf *sb2)
 {
 	strbuf_grow(sb, sb2->len);
@@ -486,7 +497,9 @@ void strbuf_add_percentencode(struct strbuf *dst, const char *src, int flags)
 		unsigned char ch = src[i];
 		if (ch <= 0x1F || ch >= 0x7F ||
 		    (ch == '/' && (flags & STRBUF_ENCODE_SLASH)) ||
-		    strchr(URL_UNSAFE_CHARS, ch))
+		    ((flags & STRBUF_ENCODE_HOST_AND_PORT) ?
+		     !isalnum(ch) && !strchr("-.:[]", ch) :
+		     !!strchr(URL_UNSAFE_CHARS, ch)))
 			strbuf_addf(dst, "%%%02X", (unsigned char)ch);
 		else
 			strbuf_addch(dst, ch);

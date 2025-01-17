@@ -25,37 +25,16 @@ value is <old-oid>.  You can specify 40 "0" or an empty string
 as <old-oid> to make sure that the ref you are creating does
 not exist.
 
-It also allows a "ref" file to be a symbolic pointer to another
-ref file by starting with the four-byte header sequence of
-"ref:".
-
-More importantly, it allows the update of a ref file to follow
-these symbolic pointers, whether they are symlinks or these
-"regular file symbolic refs".  It follows *real* symlinks only
-if they start with "refs/": otherwise it will just try to read
-them and update them as a regular file (i.e. it will allow the
-filesystem to follow them, but will overwrite such a symlink to
-somewhere else with a regular filename).
+The final arguments are object names; this command without any options
+does not support updating a symbolic ref to point to another ref (see
+linkgit:git-symbolic-ref[1]).  But `git update-ref --stdin` does have
+the `symref-*` commands so that regular refs and symbolic refs can be
+committed in the same transaction.
 
 If --no-deref is given, <ref> itself is overwritten, rather than
 the result of following the symbolic pointers.
 
-In general, using
-
-	git update-ref HEAD "$head"
-
-should be a _lot_ safer than doing
-
-	echo "$head" > "$GIT_DIR/HEAD"
-
-both from a symlink following standpoint *and* an error checking
-standpoint.  The "refs/" rule for symlinks means that symlinks
-that point to "outside" the tree are safe: they'll be followed
-for reading but not for writing (so we'll never write through a
-ref symlink to some other tree, if you have copied a whole
-archive by creating a symlink tree).
-
-With `-d` flag, it deletes the named <ref> after verifying it
+With `-d`, it deletes the named <ref> after verifying that it
 still contains <old-oid>.
 
 With `--stdin`, update-ref reads instructions from standard input and
@@ -65,6 +44,10 @@ performs all modifications together.  Specify commands of the form:
 	create SP <ref> SP <new-oid> LF
 	delete SP <ref> [SP <old-oid>] LF
 	verify SP <ref> [SP <old-oid>] LF
+	symref-update SP <ref> SP <new-target> [SP (ref SP <old-target> | oid SP <old-oid>)] LF
+	symref-create SP <ref> SP <new-target> LF
+	symref-delete SP <ref> [SP <old-target>] LF
+	symref-verify SP <ref> [SP <old-target>] LF
 	option SP <opt> LF
 	start LF
 	prepare LF
@@ -86,6 +69,10 @@ quoting:
 	create SP <ref> NUL <new-oid> NUL
 	delete SP <ref> NUL [<old-oid>] NUL
 	verify SP <ref> NUL [<old-oid>] NUL
+	symref-update SP <ref> NUL <new-target> [NUL (ref NUL <old-target> | oid NUL <old-oid>)] NUL
+	symref-create SP <ref> NUL <new-target> NUL
+	symref-delete SP <ref> [NUL <old-target>] NUL
+	symref-verify SP <ref> [NUL <old-target>] NUL
 	option SP <opt> NUL
 	start NUL
 	prepare NUL
@@ -106,16 +93,33 @@ update::
 	ref does not exist before the update.
 
 create::
-	Create <ref> with <new-oid> after verifying it does not
+	Create <ref> with <new-oid> after verifying that it does not
 	exist.  The given <new-oid> may not be zero.
 
 delete::
-	Delete <ref> after verifying it exists with <old-oid>, if
+	Delete <ref> after verifying that it exists with <old-oid>, if
 	given.  If given, <old-oid> may not be zero.
+
+symref-update::
+	Set <ref> to <new-target> after verifying <old-target> or <old-oid>,
+	if given. Specify a zero <old-oid> to ensure that the ref does not
+	exist before the update.
 
 verify::
 	Verify <ref> against <old-oid> but do not change it.  If
 	<old-oid> is zero or missing, the ref must not exist.
+
+symref-create:
+	Create symbolic ref <ref> with <new-target> after verifying that
+	it does not exist.
+
+symref-delete::
+	Delete <ref> after verifying that it exists with <old-target>, if given.
+
+symref-verify::
+	Verify symbolic <ref> against <old-target> but do not change it.
+	If <old-target> is missing, the ref must not exist.  Can only be
+	used in `no-deref` mode.
 
 option::
 	Modify the behavior of the next command naming a <ref>.
@@ -174,6 +178,21 @@ value supplied to the -m option.
 An update will fail (without changing <ref>) if the current user is
 unable to create a new log file, append to the existing log file
 or does not have committer information available.
+
+NOTES
+-----
+
+Symbolic refs were initially implemented using symbolic links.  This is
+now deprecated since not all filesystems support symbolic links.
+
+This command follows *real* symlinks only if they start with "refs/":
+otherwise it will just try to read them and update them as a regular
+file (i.e. it will allow the filesystem to follow them, but will
+overwrite such a symlink to somewhere else with a regular filename).
+
+SEE ALSO
+--------
+linkgit:git-symbolic-ref[1]
 
 GIT
 ---

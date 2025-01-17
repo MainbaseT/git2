@@ -1,3 +1,6 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "git-compat-util.h"
 #include "config.h"
 #include "environment.h"
@@ -447,7 +450,7 @@ static void fmt_merge_msg_title(struct strbuf *out,
 				const char *current_branch)
 {
 	int i = 0;
-	char *sep = "";
+	const char *sep = "";
 
 	strbuf_addstr(out, "Merge ");
 	for (i = 0; i < srcs.nr; i++) {

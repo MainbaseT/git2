@@ -1,3 +1,5 @@
+#define USE_THE_REPOSITORY_VARIABLE
+
 #include "git-compat-util.h"
 #include "gettext.h"
 #include "hex.h"
@@ -155,7 +157,7 @@ static int process(struct walker *walker, struct object *obj)
 	else {
 		if (obj->flags & COMPLETE)
 			return 0;
-		walker->prefetch(walker, obj->oid.hash);
+		walker->prefetch(walker, &obj->oid);
 	}
 
 	object_list_insert(obj, process_queue_end);
@@ -184,7 +186,7 @@ static int loop(struct walker *walker)
 		 * the queue because we needed to fetch it first.
 		 */
 		if (! (obj->flags & TO_SCAN)) {
-			if (walker->fetch(walker, obj->oid.hash)) {
+			if (walker->fetch(walker, &obj->oid)) {
 				stop_progress(&progress);
 				report_missing(obj);
 				return -1;
@@ -219,6 +221,7 @@ static int interpret_target(struct walker *walker, char *target, struct object_i
 }
 
 static int mark_complete(const char *path UNUSED,
+			const char *referent UNUSED,
 			 const struct object_id *oid,
 			 int flag UNUSED,
 			 void *cb_data UNUSED)
@@ -287,7 +290,7 @@ int walker_fetch(struct walker *walker, int targets, char **target,
 
 	if (write_ref) {
 		transaction = ref_store_transaction_begin(get_main_ref_store(the_repository),
-							  &err);
+							  0, &err);
 		if (!transaction) {
 			error("%s", err.buf);
 			goto done;

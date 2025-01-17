@@ -1,3 +1,6 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "git-compat-util.h"
 #include "abspath.h"
 #include "config.h"
@@ -10,7 +13,9 @@
 #include "sigchain.h"
 #include "strbuf.h"
 #include "urlmatch.h"
-#include "git-compat-util.h"
+#include "environment.h"
+#include "trace2.h"
+#include "repository.h"
 
 void credential_init(struct credential *c)
 {
@@ -20,12 +25,11 @@ void credential_init(struct credential *c)
 
 void credential_clear(struct credential *c)
 {
+	credential_clear_secrets(c);
 	free(c->protocol);
 	free(c->host);
 	free(c->path);
 	free(c->username);
-	free(c->password);
-	free(c->credential);
 	free(c->oauth_refresh_token);
 	free(c->authtype);
 	string_list_clear(&c->helpers, 0);
@@ -126,6 +130,10 @@ static int credential_config_callback(const char *var, const char *value,
 	}
 	else if (!strcmp(key, "usehttppath"))
 		c->use_http_path = git_config_bool(var, value);
+	else if (!strcmp(key, "sanitizeprompt"))
+		c->sanitize_prompt = git_config_bool(var, value);
+	else if (!strcmp(key, "protectprotocol"))
+		c->protect_protocol = git_config_bool(var, value);
 
 	return 0;
 }
@@ -223,7 +231,8 @@ static void credential_format(struct credential *c, struct strbuf *out)
 		strbuf_addch(out, '@');
 	}
 	if (c->host)
-		strbuf_addstr(out, c->host);
+		strbuf_add_percentencode(out, c->host,
+					 STRBUF_ENCODE_HOST_AND_PORT);
 	if (c->path) {
 		strbuf_addch(out, '/');
 		strbuf_add_percentencode(out, c->path, 0);
@@ -237,7 +246,10 @@ static char *credential_ask_one(const char *what, struct credential *c,
 	struct strbuf prompt = STRBUF_INIT;
 	char *r;
 
-	credential_describe(c, &desc);
+	if (c->sanitize_prompt)
+		credential_format(c, &desc);
+	else
+		credential_describe(c, &desc);
 	if (desc.len)
 		strbuf_addf(&prompt, "%s for '%s': ", what, desc.buf);
 	else
@@ -250,14 +262,36 @@ static char *credential_ask_one(const char *what, struct credential *c,
 	return xstrdup(r);
 }
 
-static void credential_getpass(struct credential *c)
+static int credential_getpass(struct credential *c)
 {
+	int interactive;
+	char *value;
+	if (!git_config_get_maybe_bool("credential.interactive", &interactive) &&
+	    !interactive) {
+		trace2_data_intmax("credential", the_repository,
+				   "interactive/skipped", 1);
+		return -1;
+	}
+	if (!git_config_get_string("credential.interactive", &value)) {
+		int same = !strcmp(value, "never");
+		free(value);
+		if (same) {
+			trace2_data_intmax("credential", the_repository,
+					   "interactive/skipped", 1);
+			return -1;
+		}
+	}
+
+	trace2_region_enter("credential", "interactive", the_repository);
 	if (!c->username)
 		c->username = credential_ask_one("Username", c,
 						 PROMPT_ASKPASS|PROMPT_ECHO);
 	if (!c->password)
 		c->password = credential_ask_one("Password", c,
 						 PROMPT_ASKPASS);
+	trace2_region_leave("credential", "interactive", the_repository);
+
+	return 0;
 }
 
 int credential_has_capability(const struct credential_capability *capa,
@@ -356,7 +390,8 @@ int credential_read(struct credential *c, FILE *fp,
 	return 0;
 }
 
-static void credential_write_item(FILE *fp, const char *key, const char *value,
+static void credential_write_item(const struct credential *c,
+				  FILE *fp, const char *key, const char *value,
 				  int required)
 {
 	if (!value && required)
@@ -365,6 +400,10 @@ static void credential_write_item(FILE *fp, const char *key, const char *value,
 		return;
 	if (strchr(value, '\n'))
 		die("credential value for %s contains newline", key);
+	if (c->protect_protocol && strchr(value, '\r'))
+		die("credential value for %s contains carriage return\n"
+		    "If this is intended, set `credential.protectProtocol=false`",
+		    key);
 	fprintf(fp, "%s=%s\n", key, value);
 }
 
@@ -372,34 +411,34 @@ void credential_write(const struct credential *c, FILE *fp,
 		      enum credential_op_type op_type)
 {
 	if (credential_has_capability(&c->capa_authtype, op_type))
-		credential_write_item(fp, "capability[]", "authtype", 0);
+		credential_write_item(c, fp, "capability[]", "authtype", 0);
 	if (credential_has_capability(&c->capa_state, op_type))
-		credential_write_item(fp, "capability[]", "state", 0);
+		credential_write_item(c, fp, "capability[]", "state", 0);
 
 	if (credential_has_capability(&c->capa_authtype, op_type)) {
-		credential_write_item(fp, "authtype", c->authtype, 0);
-		credential_write_item(fp, "credential", c->credential, 0);
+		credential_write_item(c, fp, "authtype", c->authtype, 0);
+		credential_write_item(c, fp, "credential", c->credential, 0);
 		if (c->ephemeral)
-			credential_write_item(fp, "ephemeral", "1", 0);
+			credential_write_item(c, fp, "ephemeral", "1", 0);
 	}
-	credential_write_item(fp, "protocol", c->protocol, 1);
-	credential_write_item(fp, "host", c->host, 1);
-	credential_write_item(fp, "path", c->path, 0);
-	credential_write_item(fp, "username", c->username, 0);
-	credential_write_item(fp, "password", c->password, 0);
-	credential_write_item(fp, "oauth_refresh_token", c->oauth_refresh_token, 0);
+	credential_write_item(c, fp, "protocol", c->protocol, 1);
+	credential_write_item(c, fp, "host", c->host, 1);
+	credential_write_item(c, fp, "path", c->path, 0);
+	credential_write_item(c, fp, "username", c->username, 0);
+	credential_write_item(c, fp, "password", c->password, 0);
+	credential_write_item(c, fp, "oauth_refresh_token", c->oauth_refresh_token, 0);
 	if (c->password_expiry_utc != TIME_MAX) {
 		char *s = xstrfmt("%"PRItime, c->password_expiry_utc);
-		credential_write_item(fp, "password_expiry_utc", s, 0);
+		credential_write_item(c, fp, "password_expiry_utc", s, 0);
 		free(s);
 	}
 	for (size_t i = 0; i < c->wwwauth_headers.nr; i++)
-		credential_write_item(fp, "wwwauth[]", c->wwwauth_headers.v[i], 0);
+		credential_write_item(c, fp, "wwwauth[]", c->wwwauth_headers.v[i], 0);
 	if (credential_has_capability(&c->capa_state, op_type)) {
 		if (c->multistage)
-			credential_write_item(fp, "continue", "1", 0);
+			credential_write_item(c, fp, "continue", "1", 0);
 		for (size_t i = 0; i < c->state_headers_to_send.nr; i++)
-			credential_write_item(fp, "state[]", c->state_headers_to_send.v[i], 0);
+			credential_write_item(c, fp, "state[]", c->state_headers_to_send.v[i], 0);
 	}
 }
 
@@ -479,9 +518,15 @@ void credential_fill(struct credential *c, int all_capabilities)
 
 	for (i = 0; i < c->helpers.nr; i++) {
 		credential_do(c, c->helpers.items[i].string, "get");
+
 		if (c->password_expiry_utc < time(NULL)) {
-			/* Discard expired password */
-			FREE_AND_NULL(c->password);
+			/*
+			 * Don't use credential_clear() here: callers such as
+			 * cmd_credential() expect to still be able to call
+			 * credential_write() on a struct credential whose
+			 * secrets have expired.
+			 */
+			credential_clear_secrets(c);
 			/* Reset expiry to maintain consistency */
 			c->password_expiry_utc = TIME_MAX;
 		}
@@ -494,8 +539,8 @@ void credential_fill(struct credential *c, int all_capabilities)
 			    c->helpers.items[i].string);
 	}
 
-	credential_getpass(c);
-	if (!c->username && !c->password && !c->credential)
+	if (credential_getpass(c) ||
+	    (!c->username && !c->password && !c->credential))
 		die("unable to get password from user");
 }
 
@@ -528,9 +573,8 @@ void credential_reject(struct credential *c)
 	for (i = 0; i < c->helpers.nr; i++)
 		credential_do(c, c->helpers.items[i].string, "erase");
 
+	credential_clear_secrets(c);
 	FREE_AND_NULL(c->username);
-	FREE_AND_NULL(c->password);
-	FREE_AND_NULL(c->credential);
 	FREE_AND_NULL(c->oauth_refresh_token);
 	c->password_expiry_utc = TIME_MAX;
 	c->approved = 0;
